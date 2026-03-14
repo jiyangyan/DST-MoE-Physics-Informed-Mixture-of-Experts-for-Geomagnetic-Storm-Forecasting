@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 # 忽略warning输出
+import torch.nn.functional as F
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -405,7 +406,7 @@ class AbnormalExpert(nn.Module):
         
         # ========== 9. 全连接层 ==========
         self.fc1 = nn.Linear(self.flatten_dim, 256)
-        self.fc2 = nn.Linear(256, 2)
+        self.fc2 = nn.Linear(256, 6)
         
     def forward(self, x):
         # x形状: [batch_size, timesteps, input_dim]
@@ -440,9 +441,9 @@ class AbnormalExpert(nn.Module):
         
         # 9. 全连接层
         x = F.relu(self.fc1(x))  # [batch, 256]
-        x = self.fc2(x)  # [batch, 2]
+        x = self.fc2(x)  # [batch, 6]
         
-        return x
+        return x.view(-1,2,3)
     
     def get_num_params(self):
         """获取模型参数数量"""
@@ -690,22 +691,25 @@ def prepare_abnormal_expert_validation(val_df, timesteps, feature_cols, label_co
     return sequences, labels
 
 
-def weighted_mse_loss(pred, target, threshold=-50, normal_weight=1.0, abnormal_weight=5.0):
-    """加权MSE损失函数，给异常值更高权重"""
-    # 计算基础MSE
-    base_loss = (pred - target) ** 2
-
-    # 创建权重矩阵
-    weights = torch.ones_like(target) * normal_weight
-
-    # 给异常值更高权重
-    abnormal_mask = target < threshold
-    weights[abnormal_mask] = abnormal_weight
-
-    # 计算加权损失
-    weighted_loss = (base_loss * weights).mean()
-
-    return weighted_loss, weights.mean().item()
+def weighted_quantile_loss(predictions, targets, quantiles=[0.05, 0.5, 0.95]):
+    """
+    加权分位数损失：对每个样本根据真实值赋权
+    """
+    # 计算样本权重
+    weights = torch.ones_like(targets)
+    weights[targets < -50] = 3.0
+    weights[targets < -100] = 5.0
+    weights = weights.mean(dim=1)  # 将两个时间点的权重合并为每个样本一个权重，或者逐点加权
+    
+    loss = 0.0
+    for i, q in enumerate(quantiles):
+        pred_q = predictions[:, :, i]
+        error = targets - pred_q
+        loss_q = torch.max(q * error, (q - 1) * error)  # [batch, 2]
+        # 对每个样本的两个时间点求平均，再乘以样本权重
+        loss_q = loss_q.mean(dim=1)  # [batch]
+        loss += (loss_q * weights).mean()
+    return loss
 
 
 def train_abnormal_expert():
@@ -760,8 +764,7 @@ def train_abnormal_expert():
 
     # 损失函数和优化器
     # 使用自定义的加权损失函数
-    criterion = lambda pred, target: weighted_mse_loss(pred, target, threshold=-50, normal_weight=1.0, abnormal_weight=10.0)
-
+    criterion = weighted_quantile_loss
     optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-5)
 
     # 学习率调度器
@@ -785,7 +788,6 @@ def train_abnormal_expert():
     # 训练历史
     history = {
         'train_loss': [], 'val_loss': [],
-        'train_weight': [], 'val_weight': [],
         'learning_rate': []
     }
 
@@ -798,7 +800,6 @@ def train_abnormal_expert():
         # 训练阶段
         model.train()
         train_loss = 0.0
-        train_weight = 0.0
         train_batches = 0
 
         progress_bar = tqdm(train_loader, desc="训练", leave=False)
@@ -807,7 +808,7 @@ def train_abnormal_expert():
 
             optimizer.zero_grad()
             outputs = model(batch_x)
-            loss, weight = criterion(outputs, batch_y)
+            loss = criterion(outputs, batch_y)
             loss.backward()
 
             # 梯度裁剪
@@ -816,18 +817,15 @@ def train_abnormal_expert():
             optimizer.step()
 
             train_loss += loss.item()
-            train_weight += weight
             train_batches += 1
 
-            progress_bar.set_postfix({'loss': loss.item(), 'weight': weight})
+            progress_bar.set_postfix({'loss': loss.item()})
 
         avg_train_loss = train_loss / train_batches
-        avg_train_weight = train_weight / train_batches
 
         # 验证阶段
         model.eval()
         val_loss = 0.0
-        val_weight = 0.0
         val_batches = 0
 
         with torch.no_grad():
@@ -838,8 +836,9 @@ def train_abnormal_expert():
             for batch_x, batch_y in progress_bar:
                 batch_x, batch_y = batch_x.to(device), batch_y.to(device)
 
-                outputs = model(batch_x)
-                loss = val_criterion(outputs, batch_y)
+                outputs = model(batch_x)                # [batch, 2, 3]
+                median_pred = outputs[:, :, 1]          # 取中位数 [batch, 2]
+                loss = F.mse_loss(median_pred, batch_y) # 使用 functional 中的 mse_loss
 
                 val_loss += loss.item()
                 val_batches += 1
@@ -854,11 +853,10 @@ def train_abnormal_expert():
         # 记录历史
         history['train_loss'].append(avg_train_loss)
         history['val_loss'].append(avg_val_loss)
-        history['train_weight'].append(avg_train_weight)
         history['learning_rate'].append(optimizer.param_groups[0]['lr'])
 
         # 打印epoch结果
-        print(f"训练损失: {avg_train_loss:.6f} (平均权重: {avg_train_weight:.2f})")
+        print(f"训练损失: {avg_train_loss:.6f} ")
         print(f"验证损失: {avg_val_loss:.6f}")
         print(f"验证RMSE: {np.sqrt(avg_val_loss):.6f}")
         print(f"学习率: {optimizer.param_groups[0]['lr']:.6f}")
@@ -888,7 +886,7 @@ def train_abnormal_expert():
     plt.grid(True, alpha=0.3)
 
     plt.subplot(1, 3, 2)
-    plt.plot(np.sqrt(history['train_loss']), label='Train RMSE(weighted)')
+    plt.plot(np.sqrt(history['train_loss']), label='Train RMSE(median)')
     plt.plot(np.sqrt(history['val_loss']), label='Val RMSE')
     plt.xlabel('Epoch')
     plt.ylabel('RMSE')
@@ -994,7 +992,8 @@ def test_abnormal_expert():
             batch_x, batch_y = batch_x.to(device), batch_y.to(device)
             
             outputs = model(batch_x)
-            loss = criterion(outputs, batch_y)
+            median_pred = outputs[:, :, 1]
+            loss = F.mse_loss(median_pred, batch_y)
             test_loss += loss.item() * len(batch_x)
     
     # 计算平均损失

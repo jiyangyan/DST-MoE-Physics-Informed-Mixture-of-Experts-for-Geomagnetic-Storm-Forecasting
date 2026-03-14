@@ -445,43 +445,40 @@ class DummyModel(nn.Module):
         return x
 
 def initialize_actual_model_with_dummy(actual_model, dummy_model):
-    """用虚拟模型的参数初始化实际模型"""
-
-    # 获取两个模型的state_dict
+    """用虚拟模型的参数初始化实际模型（截断方式：当形状不匹配时，用虚拟模型的前若干维填充）"""
     actual_state_dict = actual_model.state_dict()
     dummy_state_dict = dummy_model.state_dict()
 
     for name, param in dummy_state_dict.items():
-        # 只处理在actual_model中也存在的参数
         if name in actual_state_dict:
             actual_param = actual_state_dict[name]
             dummy_param = param
 
-            # 如果形状完全匹配，直接复制
+            # 如果形状完全相同，直接复制
             if actual_param.shape == dummy_param.shape:
                 actual_state_dict[name] = dummy_param.clone()
-
-            # 如果形状不匹配，以截断的方法复制参数
             else:
-                # 截断方法：取虚拟模型参数的前n个元素
-                if len(actual_param.shape) == 1:  # 偏置或1D参数
+                # 形状不匹配时，截断复制（只复制公共部分）
+                # 根据维度数分别处理
+                if len(actual_param.shape) == 1:  # 1D参数（如偏置）
                     min_dim = min(actual_param.shape[0], dummy_param.shape[0])
-                    actual_state_dict[name].data.copy_(dummy_param[:min_dim])
-
-                elif len(actual_param.shape) == 2:  # 全连接层权重
+                    actual_param.data[:min_dim].copy_(dummy_param[:min_dim])
+                
+                elif len(actual_param.shape) == 2:  # 2D参数（全连接层权重）
                     min_out = min(actual_param.shape[0], dummy_param.shape[0])
                     min_in = min(actual_param.shape[1], dummy_param.shape[1])
-                    actual_state_dict[name].data.copy_(dummy_param[:min_out, :min_in])
-
-                elif len(actual_param.shape) == 3:  # 卷积层权重
+                    actual_param.data[:min_out, :min_in].copy_(
+                        dummy_param[:min_out, :min_in]
+                    )
+                
+                elif len(actual_param.shape) == 3:  # 3D参数（卷积层权重）
                     min_out = min(actual_param.shape[0], dummy_param.shape[0])
                     min_in = min(actual_param.shape[1], dummy_param.shape[1])
                     min_kernel = min(actual_param.shape[2], dummy_param.shape[2])
-                    actual_state_dict[name].data.copy_(
+                    actual_param.data[:min_out, :min_in, :min_kernel].copy_(
                         dummy_param[:min_out, :min_in, :min_kernel]
                     )
-
-    # 将更新后的state_dict加载回实际模型
+                    
     actual_model.load_state_dict(actual_state_dict)
     return actual_model
 
@@ -558,7 +555,7 @@ class ActualModel(nn.Module):
 
         # ========== 9. 全连接层 ==========
         self.fc1 = nn.Linear(self.flatten_dim, 256)
-        self.fc2 = nn.Linear(256, 2)
+        self.fc2 = nn.Linear(256, 6)
 
     def forward(self, x):
         # x形状: [batch_size, timesteps, input_dim]
@@ -593,9 +590,9 @@ class ActualModel(nn.Module):
 
         # 9. 全连接层
         x = F.relu(self.fc1(x))  # [batch, 256]
-        x = self.fc2(x)  # [batch, 2]
+        x = self.fc2(x)  # [batch, 6]
 
-        return x
+        return x.view(-1,2,3)
 
 input_dim = len(XCOLS)
 timesteps = data_config["timesteps"]
@@ -611,60 +608,24 @@ print(f"模型参数数量（实际模型）: {sum(p.numel() for p in actual_mod
 # ========== 主训练与模型评估 ==========
 
 # 具有物理意义的损失函数
-class DstPhysicsLoss(nn.Module):
-    def __init__(self, lambda_physics=0.01, indices=None):
+class QuantileLoss(nn.Module):
+    """分位数损失函数"""
+    def __init__(self, quantiles=[0.05, 0.5, 0.95]):
+        super(QuantileLoss, self).__init__()
+        self.quantiles = quantiles
+
+    def forward(self, predictions, targets):
         """
-        Args:
-            lambda_physics: 物理损失的权重
-            indices: 字典，包含 'speed' 和 'bz' 在特征维度中的索引位置
+        predictions: [batch, 2, n_quantiles]
+        targets: [batch, 2]
         """
-        super(DstPhysicsLoss, self).__init__()
-        self.mse = nn.MSELoss()
-        self.lambda_physics = lambda_physics
-        self.indices = indices
-
-        # 对应 Burton方程: dDst/dt = alpha * (V * Bs) - Dst / tau
-        # 初始化为经验值附近
-        self.alpha = nn.Parameter(torch.tensor(-5.0e-3)) # 注入系数
-        self.tau_inv = nn.Parameter(torch.tensor(1.0/20.0)) # 衰减系数 (1/tau)
-
-    def forward(self, predictions, targets, inputs):
-        """
-        predictions: [batch, 2] -> (t0_dst, t1_dst)
-        targets: [batch, 2] -> (t0_dst_true, t1_dst_true)
-        inputs: [batch, timesteps, features] -> 原始输入数据
-        """
-        # 数据驱动损失 (MSE)
-        data_loss = self.mse(predictions, targets)
-
-        # 物理驱动损失
-        # dDst/dt ≈ (Dst_t1 - Dst_t0) / delta_t
-        pred_t0 = predictions[:, 0]
-        pred_t1 = predictions[:, 1]
-        d_dst_dt_pred = pred_t1 - pred_t0
-
-        v_idx = self.indices['speed']
-        bz_idx = self.indices['bz']
-
-        # 提取 V 和 Bz (已归一化)
-        V = inputs[:, -1, v_idx]
-        Bz = inputs[:, -1, bz_idx]
-
-        # 计算南向磁场 Bs (当 Bz < 0 时为 -Bz，否则为 0)
-        Bs = torch.relu(-Bz)
-
-        # 注入项 Q = alpha * V * Bs
-        injection = self.alpha * V * Bs
-
-        # 衰减项 Decay = Dst / tau
-        decay = pred_t0 * self.tau_inv
-
-        # 物理残差: dDst/dt - (Injection - Decay) = 0
-        physics_residual = d_dst_dt_pred - (injection - decay)
-
-        physics_loss = torch.mean(physics_residual ** 2)
-
-        return data_loss + self.lambda_physics * physics_loss
+        loss = 0.0
+        for i, q in enumerate(self.quantiles):
+            pred_q = predictions[:, :, i]
+            error = targets - pred_q
+            loss_q = torch.max(q * error, (q - 1) * error)
+            loss += loss_q.mean()
+        return loss
 
 # 自定义学习率调度器
 class ReduceLRBacktrack:
@@ -810,20 +771,8 @@ class RMSELoss(nn.Module):
     def forward(self, y_pred, y_true):
         return torch.sqrt(torch.mean((y_pred - y_true)**2))
 
-# 在 XCOLS 中找到 speed_mean 和 bz_gsm_mean 的位置
-try:
-    speed_idx = XCOLS.index("speed_mean")
-    bz_idx = XCOLS.index("bz_gsm_mean")
-    feature_indices = {"speed": speed_idx, "bz": bz_idx}
-    print(f"特征索引: Speed={speed_idx}, Bz={bz_idx}")
-except ValueError:
-    print("错误: 无法在 XCOLS 中找到对应的物理特征列名")
-
-criterion = DstPhysicsLoss(lambda_physics=0.03, indices=feature_indices).to(device)
-
-# 将模型参数和Loss参数合并
-all_parameters = list(model.parameters()) + list(criterion.parameters())
-optimizer = optim.Adam(all_parameters, lr=0.001)
+criterion = QuantileLoss(quantiles=[0.05, 0.5, 0.95]).to(device)
+optimizer = optim.Adam(model.parameters(), lr=0.001)
 
 # 学习率调度器
 scheduler = ReduceLRBacktrack(
@@ -852,7 +801,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
         optimizer.zero_grad()
         outputs = model(batch_x)
 
-        loss = criterion(outputs, batch_y, batch_x)
+        loss = criterion(outputs, batch_y)
 
         loss.backward()
         optimizer.step()
@@ -875,7 +824,7 @@ def validate_epoch(model, dataloader, criterion, device):
             batch_y = batch_y.to(device)
 
             outputs = model(batch_x)
-            loss = criterion(outputs, batch_y, batch_x)
+            loss = criterion(outputs, batch_y)
 
             running_loss += loss.item()
             batch_count += 1
@@ -975,26 +924,25 @@ test_ds = timeseries_dataset_from_df(test, data_config["batch_size"])
 print(f"测试集批次数量: {len(test_ds)}")
 
 # 在测试集上评估
-def evaluate_simple(model, test_dataloader, criterion, device):
+def evaluate_simple(model, test_dataloader, device):
     model.eval()
     running_loss = 0.0
     batch_count = 0
 
     with torch.no_grad():
         for batch_x, batch_y in test_dataloader:
-            batch_x = batch_x.to(device)
-            batch_y = batch_y.to(device)
-
-            outputs = model(batch_x)
-            loss = criterion(outputs, batch_y)
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            outputs = model(batch_x) # 形状 [batch, 2, 3]
+            
+            # 使用中位数预测作为最终点估计计算 MSE
+            median_output = outputs[:, :, 1] 
+            loss = F.mse_loss(median_output, batch_y)
 
             running_loss += loss.item()
             batch_count += 1
-
     return running_loss / max(batch_count, 1)
 
-criterion = nn.MSELoss()
-test_mse = evaluate_simple(model, test_ds, criterion, device)
+test_mse = evaluate_simple(model, test_ds, device)
 test_rmse = np.sqrt(test_mse)
 
 print(f"测试集MSE: {test_mse:.6f}")

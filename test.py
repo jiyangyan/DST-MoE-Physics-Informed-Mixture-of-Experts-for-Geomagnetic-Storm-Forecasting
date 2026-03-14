@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 # 忽略warning输出
+from scipy import stats
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -500,8 +501,9 @@ def prepare_gate_datasets(train_df, val_df, timesteps, feature_cols, label_cols,
 # 专家子网
 # 正常专家
 class NormalExpert(nn.Module):
-    def __init__(self, input_dim, timesteps):
+    def __init__(self, input_dim, timesteps,n_quantiles=3):
         super(NormalExpert, self).__init__()
+        self.n_quantiles = n_quantiles
         self.timesteps = timesteps
         self.input_dim = input_dim
 
@@ -572,7 +574,7 @@ class NormalExpert(nn.Module):
 
         # ========== 9. 全连接层 ==========
         self.fc1 = nn.Linear(self.flatten_dim, 256)
-        self.fc2 = nn.Linear(256, 2)
+        self.fc2 = nn.Linear(256, n_quantiles * 2)
 
     def forward(self, x):
         # x形状: [batch_size, timesteps, input_dim]
@@ -609,7 +611,7 @@ class NormalExpert(nn.Module):
         x = F.relu(self.fc1(x))  # [batch, 256]
         x = self.fc2(x)  # [batch, 2]
 
-        return x
+        return x.view(-1, 2, self.n_quantiles)
 
     def get_num_params(self):
         """获取模型参数数量"""
@@ -617,9 +619,10 @@ class NormalExpert(nn.Module):
 
 # 异常专家
 class AbnormalExpert(nn.Module):
-    def __init__(self, input_dim, timesteps):
+    def __init__(self, input_dim, timesteps, n_quantiles=3):
         super(AbnormalExpert, self).__init__()
         self.timesteps = timesteps
+        self.n_quantiles = n_quantiles
         self.input_dim = input_dim
                 
         # ========== 1. TimeDistributed Dense ==========
@@ -689,7 +692,7 @@ class AbnormalExpert(nn.Module):
         
         # ========== 9. 全连接层 ==========
         self.fc1 = nn.Linear(self.flatten_dim, 256)
-        self.fc2 = nn.Linear(256, 2)
+        self.fc2 = nn.Linear(256, n_quantiles * 2)
         
     def forward(self, x):
         # x形状: [batch_size, timesteps, input_dim]
@@ -724,9 +727,9 @@ class AbnormalExpert(nn.Module):
         
         # 9. 全连接层
         x = F.relu(self.fc1(x))  # [batch, 256]
-        x = self.fc2(x)  # [batch, 2]
+        x = self.fc2(x)  # [batch, 6]
         
-        return x
+        return x.view(-1, 2, self.n_quantiles)
     
     def get_num_params(self):
         """获取模型参数数量"""
@@ -747,63 +750,65 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"使用设备: {device}")
 
 class MoESystem(nn.Module):
-    """完整的MoE系统"""
-    def __init__(self, gate_model, normal_expert, abnormal_expert, confidence_threshold=0.7):
+    def __init__(self, gate_model, normal_expert, abnormal_expert, confidence_threshold=0.7, n_quantiles=3):
         super(MoESystem, self).__init__()
         self.gate_model = gate_model
         self.normal_expert = normal_expert
         self.abnormal_expert = abnormal_expert
         self.confidence_threshold = confidence_threshold
+        self.n_quantiles = n_quantiles
 
-    def forward(self, x, mode='adaptive'):
-        """
-        Args:
-            x: 输入序列 [batch_size, timesteps, input_dim]
-            mode: 'gate' (直接使用门控) | 'adaptive' (自适应门控) | 'perfect' (完美门控)
-            y_true: 真实标签（仅完美门控模式需要）
-        """
+    def forward(self, x, mode='adaptive', return_quantiles=False):
         batch_size = x.size(0)
 
         if mode == 'perfect':
-            # 完美门控模式需要额外的y_true参数
-            return None  # 这个模式在外部处理
+            # 完美门控需要外部处理，这里暂不返回分位数
+            return None
 
-        # 获取门控决策
         gate_outputs = self.gate_model(x)
         gate_probs, gate_decisions = torch.max(gate_outputs, dim=1)
 
-        outputs = torch.zeros(batch_size, 2, device=x.device)
+        # 准备存放结果的张量
+        if return_quantiles:
+            # 返回所有分位数
+            outputs = torch.zeros(batch_size, 2, self.n_quantiles, device=x.device)
+        else:
+            # 返回中位数（用于评估）
+            outputs = torch.zeros(batch_size, 2, device=x.device)
 
+        # 计算掩码
         if mode == 'gate':
-            # 直接门控模式：完全相信门控网络
             normal_mask = gate_decisions == 0
             abnormal_mask = gate_decisions == 1
-
         elif mode == 'adaptive':
-            # 自适应门控模式：高置信度用门控，低置信度用正常专家（保守）
             high_confidence_mask = gate_probs >= self.confidence_threshold
             low_confidence_mask = gate_probs < self.confidence_threshold
-
-            # 高置信度样本使用门控决策
             high_conf_normal = high_confidence_mask & (gate_decisions == 0)
             high_conf_abnormal = high_confidence_mask & (gate_decisions == 1)
-
-            # 低置信度样本使用正常专家（保守策略）
             low_conf_all = low_confidence_mask
-
             normal_mask = high_conf_normal | low_conf_all
             abnormal_mask = high_conf_abnormal
 
-        # 使用对应专家进行预测
+        # 正常专家预测
         if normal_mask.any():
-            normal_x = x[normal_mask]
-            outputs[normal_mask] = self.normal_expert(normal_x)
+            normal_out = self.normal_expert(x[normal_mask])  # [n_normal, 2, n_quantiles]
+            if return_quantiles:
+                outputs[normal_mask] = normal_out
+            else:
+                outputs[normal_mask] = normal_out[:, :, 1]   # 取中位数
 
+        # 异常专家预测
         if abnormal_mask.any():
-            abnormal_x = x[abnormal_mask]
-            outputs[abnormal_mask] = self.abnormal_expert(abnormal_x)
+            abnormal_out = self.abnormal_expert(x[abnormal_mask])
+            if return_quantiles:
+                outputs[abnormal_mask] = abnormal_out
+            else:
+                outputs[abnormal_mask] = abnormal_out[:, :, 1]
 
-        return outputs, gate_decisions, gate_probs
+        if return_quantiles:
+            return outputs, gate_decisions, gate_probs
+        else:
+            return outputs, gate_decisions, gate_probs
 
 
 def load_all_models():
@@ -821,14 +826,14 @@ def load_all_models():
     print(f"门控网络加载成功 (准确率: {gate_checkpoint.get('val_accuracy', 'N/A'):.4f})")
 
     # 加载正常专家
-    normal_expert = NormalExpert(input_dim, timesteps).to(device)
+    normal_expert = NormalExpert(input_dim, timesteps, n_quantiles=3).to(device)
     normal_checkpoint = torch.load('expert_checkpoints/normal_expert_best.pth', map_location=device)
     normal_expert.load_state_dict(normal_checkpoint['model_state_dict'])
     normal_expert.eval()
     print(f"正常专家加载成功 (验证损失: {normal_checkpoint.get('best_value', 'N/A'):.6f})")
 
     # 加载异常专家
-    abnormal_expert = AbnormalExpert(input_dim, timesteps).to(device)
+    abnormal_expert = AbnormalExpert(input_dim, timesteps, n_quantiles=3).to(device)
     abnormal_checkpoint = torch.load('expert_checkpoints/abnormal_expert_best.pth', map_location=device)
     abnormal_expert.load_state_dict(abnormal_checkpoint['model_state_dict'])
     abnormal_expert.eval()
@@ -868,51 +873,59 @@ def prepare_test_data(test_df):
     return test_sequences, test_labels, is_abnormal
 
 
-def test_moe_system(moe_system, test_sequences, test_labels, mode='adaptive'):
-    """测试MoE系统"""
+def test_moe_system(moe_system, test_sequences, test_labels, mode='adaptive', collect_quantiles=False):
+    """
+    测试MoE系统，并可选择收集全部分位数
+    Args:
+        collect_quantiles: 如果为True，返回所有分位数预测
+    """
     print(f"\n测试MoE系统 (模式: {mode})...")
-
-    # 创建DataLoader
     dataset = TensorDataset(
         torch.FloatTensor(test_sequences),
         torch.FloatTensor(test_labels)
     )
     dataloader = DataLoader(dataset, batch_size=128, shuffle=False)
-
     criterion = nn.MSELoss()
 
-    all_predictions = []
+    all_predictions = []          # 中位数预测
     all_labels = []
     all_gate_decisions = []
     all_gate_confidences = []
+    if collect_quantiles:
+        all_quantiles = []        # 存储全部分位数 [batch, 2, n_quantiles]
 
     with torch.no_grad():
         for batch_x, batch_y in tqdm(dataloader, desc="测试"):
             batch_x, batch_y = batch_x.to(device), batch_y.to(device)
 
             if mode == 'perfect':
-                # 完美门控：根据真实标签选择专家
+                # 完美门控分支
                 is_abnormal_batch = (batch_y < -50).any(dim=1)
-
                 outputs = torch.zeros_like(batch_y, device=device)
-
                 normal_mask = ~is_abnormal_batch
                 abnormal_mask = is_abnormal_batch
-
                 if normal_mask.any():
-                    normal_outputs = moe_system.normal_expert(batch_x[normal_mask])
-                    outputs[normal_mask] = normal_outputs
-
+                    normal_out = moe_system.normal_expert(batch_x[normal_mask])
+                    outputs[normal_mask] = normal_out[:, :, 1]
                 if abnormal_mask.any():
-                    abnormal_outputs = moe_system.abnormal_expert(batch_x[abnormal_mask])
-                    outputs[abnormal_mask] = abnormal_outputs
-
+                    abnormal_out = moe_system.abnormal_expert(batch_x[abnormal_mask])
+                    outputs[abnormal_mask] = abnormal_out[:, :, 1]
                 gate_decisions = is_abnormal_batch.long()
                 gate_confidences = torch.ones_like(is_abnormal_batch.float())
-
+                if collect_quantiles:
+                    # 完美门控模式下收集分位数
+                    quantiles = torch.zeros(batch_x.size(0), 2, moe_system.n_quantiles, device=device)
+                    if normal_mask.any():
+                        quantiles[normal_mask] = normal_out
+                    if abnormal_mask.any():
+                        quantiles[abnormal_mask] = abnormal_out
+                    all_quantiles.append(quantiles.cpu())
             else:
-                # 门控或自适应门控
-                outputs, gate_decisions, gate_confidences = moe_system(batch_x, mode=mode)
+                # 非完美门控：先获取中位数（用于RMSE），同时可选择获取分位数
+                outputs, gate_decisions, gate_confidences = moe_system(batch_x, mode=mode, return_quantiles=False)
+                if collect_quantiles:
+                    quantiles, _, _ = moe_system(batch_x, mode=mode, return_quantiles=True)
+                    all_quantiles.append(quantiles.cpu())
 
             all_predictions.append(outputs.cpu())
             all_labels.append(batch_y.cpu())
@@ -925,53 +938,25 @@ def test_moe_system(moe_system, test_sequences, test_labels, mode='adaptive'):
     all_gate_decisions = torch.cat(all_gate_decisions, dim=0)
     all_gate_confidences = torch.cat(all_gate_confidences, dim=0)
 
-    # 计算指标
-    mse = criterion(all_predictions, all_labels).item()
-    rmse = np.sqrt(mse)
-
-    # 计算门控准确率（完美门控模式除外）
-    if mode != 'perfect':
-        true_abnormal = (all_labels < -50).any(dim=1)
-        gate_accuracy = (all_gate_decisions == true_abnormal.long()).float().mean().item()
-    else:
-        gate_accuracy = 1.0  # 完美门控准确率为1
-
-    # 分别计算正常和异常样本的性能
-    true_abnormal = (all_labels < -50).any(dim=1)
-
-    if true_abnormal.any():
-        abnormal_predictions = all_predictions[true_abnormal]
-        abnormal_labels = all_labels[true_abnormal]
-        abnormal_mse = criterion(abnormal_predictions, abnormal_labels).item()
-        abnormal_rmse = np.sqrt(abnormal_mse)
-    else:
-        abnormal_rmse = 0
-
-    normal_predictions = all_predictions[~true_abnormal]
-    normal_labels = all_labels[~true_abnormal]
-
-    if normal_predictions.numel() > 0:
-        normal_mse = criterion(normal_predictions, normal_labels).item()
-        normal_rmse = np.sqrt(normal_mse)
-    else:
-        normal_rmse = 0
-
-    return {
-        'mse': mse,
-        'rmse': rmse,
-        'normal_rmse': normal_rmse,
-        'abnormal_rmse': abnormal_rmse,
-        'gate_accuracy': gate_accuracy,
+    results = {
+        'mse': criterion(all_predictions, all_labels).item(),
+        'rmse': np.sqrt(criterion(all_predictions, all_labels).item()),
+        'normal_rmse': 0, 'abnormal_rmse': 0,
+        'gate_accuracy': (all_gate_decisions == (all_labels < -50).any(dim=1).long()).float().mean().item() if mode != 'perfect' else 1.0,
         'gate_decisions': all_gate_decisions,
         'gate_confidences': all_gate_confidences,
         'predictions': all_predictions,
         'labels': all_labels
     }
+    if collect_quantiles:
+        results['quantiles'] = torch.cat(all_quantiles, dim=0)   # [n_samples, 2, n_quantiles]
+
+    return results
 
 
-def plot_moe_results(all_results):
+def plot_moe_results(all_results, sample_idx=0):
     """绘制MoE系统结果"""
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    fig, axes = plt.subplots(3, 3, figsize=(15, 10))
 
     modes = list(all_results.keys())
     rmse_values = [results['rmse'] for results in all_results.values()]
@@ -1043,6 +1028,74 @@ def plot_moe_results(all_results):
     # 添加数值标签
     axes[1, 2].text(0, baseline_rmse, f'{baseline_rmse:.4f}', ha='center', va='bottom')
     axes[1, 2].text(1, rmse_values[0], f'{rmse_values[0]:.4f}', ha='center', va='bottom')
+
+    # 不确定度可视化
+    if 'adaptive' in all_results and 'quantiles' in all_results['adaptive']:
+        quantiles = all_results['adaptive']['quantiles']
+        labels = all_results['adaptive']['labels']
+        predictions = all_results['adaptive']['predictions']
+        
+        if sample_idx is None:
+            sample_idx = 0
+
+        q_low = quantiles[sample_idx, :, 0].numpy()
+        q_mid = quantiles[sample_idx, :, 1].numpy()
+        q_high = quantiles[sample_idx, :, 2].numpy()
+        true = labels[sample_idx].numpy()
+
+        x_pos = np.arange(2)
+        ax_unc = axes[2, 1]          # 使用第三行中间的子图
+        ax_unc.bar(x_pos, q_high - q_low, bottom=q_low, width=0.4,
+                alpha=0.3, color='gray', label='80% CI')
+        ax_unc.scatter(x_pos, q_mid, color='red', s=50, label='Predicted median', zorder=5)
+        ax_unc.scatter(x_pos, true, color='blue', s=50, marker='x', label='True', zorder=5)
+        ax_unc.set_xlabel('Time step')
+        ax_unc.set_ylabel('Dst')
+        ax_unc.set_xticks(x_pos)
+        ax_unc.set_xticklabels(['t0', 't1'])
+        ax_unc.set_title(f'Prediction Interval (Sample {sample_idx})')
+        ax_unc.legend()
+        ax_unc.grid(True, alpha=0.3)
+    
+    if 'adaptive' in all_results and 'quantiles' in all_results['adaptive']:
+        quantiles = all_results['adaptive']['quantiles']  # [n_samples, 2, 3]
+        labels = all_results['adaptive']['labels']        # [n_samples, 2]
+        
+        dist_sample_idx = sample_idx  
+        # 提取该样本 t0 的三个分位数
+        q05 = quantiles[dist_sample_idx, 0, 0].item()   # 5%
+        q50 = quantiles[dist_sample_idx, 0, 1].item()   # 50%
+        q95 = quantiles[dist_sample_idx, 0, 2].item()   # 95%
+        true_val = labels[dist_sample_idx, 0].item()    # 真实值
+
+        # 假设预测分布为正态分布，用中位数作为均值，用分位数估计标准差
+        # 标准正态的 5% 和 95% 分位数约为 -1.645 和 1.645，差值 = 3.29 * sigma
+        sigma = (q95 - q05) / (2 * 1.645)  # 2*1.645 = 3.29
+        mu = q50
+
+        # 生成 x 范围（真实值附近扩展一些）
+        x_min = min(q05, true_val) - 2 * sigma
+        x_max = max(q95, true_val) + 2 * sigma
+        x = np.linspace(x_min, x_max, 200)
+        # 正态分布概率密度
+        from scipy.stats import norm
+        pdf = norm.pdf(x, mu, sigma)
+
+        # 在 axes[2,0] 上绘制
+        ax_dist = axes[2, 0]
+        ax_dist.plot(x, pdf, 'b-', label='Estimated PDF')
+        ax_dist.axvline(true_val, color='r', linestyle='--', label=f'True = {true_val:.2f}')
+        ax_dist.axvline(q05, color='gray', linestyle=':', alpha=0.7)
+        ax_dist.axvline(q95, color='gray', linestyle=':', alpha=0.7)
+        ax_dist.fill_between(x, 0, pdf, where=(x >= q05) & (x <= q95), 
+                             alpha=0.2, color='gray', label='80% CI')
+        ax_dist.set_xlabel('Dst')
+        ax_dist.set_ylabel('Probability Density')
+        ax_dist.set_title(f'Predicted Distribution (t0, sample {dist_sample_idx})')
+        ax_dist.legend()
+        ax_dist.grid(True, alpha=0.3)
+
+    fig.delaxes(axes[2, 2])
 
     plt.tight_layout()
     plt.savefig('moe_system_results.png', dpi=150, bbox_inches='tight')
@@ -1176,7 +1229,8 @@ def main():
 
     # 测试自适应门控
     print("\n3. 自适应门控模式 (置信度阈值=0.7)...")
-    adaptive_results = test_moe_system(moe_system, test_sequences, test_labels, mode='adaptive')
+    # 测试自适应门控并收集分位数
+    adaptive_results = test_moe_system(moe_system, test_sequences, test_labels,  mode='adaptive', collect_quantiles=True)
     all_results['adaptive'] = adaptive_results
     print(f"  自适应门控RMSE: {adaptive_results['rmse']:.6f}")
     print(f"  门控准确率: {adaptive_results['gate_accuracy']:.4f}")
