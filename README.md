@@ -90,6 +90,30 @@ tqdm
     python test.py
     ```
 
+## 版本说明
+
+本项目包含两个模型版本，分别位于根目录和 `uncertainty/` 子目录中：
+
+### 🔹 确定性版本（根目录）
+- **特点**：原始 MoE 模型，采用点估计输出（仅预测 Dst 值）。正常专家使用 **物理信息损失函数**（PINN），异常专家使用 **数据增强** 训练。
+- **文件位置**：
+  - 训练脚本：`train_gate.py`, `train_normal.py`, `train_abnormal.py`
+  - 测试脚本：`test.py`
+  - 预训练权重：`gate_checkpoints/`, `expert_checkpoints/`
+- **适用场景**：需要高精度点预测，且希望预测符合物理规律（Burton 方程）。
+
+### 🔹 不确定性版本（`uncertainty/` 子目录）
+- **特点**：改进版模型，基于 Zhang et al. (2020) [3] 提出的神经网络与分位数回归方法，输出多个分位数（0.05, 0.5, 0.95），实现概率预测。模型使用 **分位数损失（Pinball Loss）** 进行训练，**移除了物理约束**。测试时不仅能给出点预测，还能生成预测区间和概率密度图，从而量化预测的不确定性。
+- **文件位置**：
+  - 训练脚本：`uncertainty/train_gate.py`, `uncertainty/train_normal.py`, `uncertainty/train_abnormal.py`
+  - 测试脚本：`uncertainty/test.py`
+  - 预训练权重：`uncertainty/gate_checkpoints/`, `uncertainty/expert_checkpoints/`
+- **适用场景**：需要了解预测置信度、进行风险评估或可视化预测不确定性的任务。
+- **方法来源**：该方法的核心思想借鉴了 Zhang et al. (2020) 在相对论电子通量预测中成功应用的**神经网络分位数回归**框架 [3]。
+
+两个版本的数据预处理流程相同（均需从 NOAA 网站下载原始数据），训练与测试步骤也基本一致，请根据需求进入相应目录操作。
+
 ## 参考文献
 [1] Jahin, M. A., et al. (2024). *TriQXNet: Forecasting Dst Index from Solar Wind Data Using an Interpretable Parallel Classical-Quantum Framework with Uncertainty Quantification*. arXiv:2407.06658. [![arXiv](https://img.shields.io/badge/arXiv-2407.06658-b31b1b.svg)](https://arxiv.org/abs/2407.06658)
 [2] Magnet Geomagnetic Field Prediction Challenge - 1st Place Solution. [GitHub Repository](https://github.com/drivendataorg/magnet-geomagnetic-field/tree/main/1st_Place)
+[3] Zhang, H., et al. (2020). *Relativistic Electron Flux Prediction at Geosynchronous Orbit Based on the Neural Network and the Quantile Regression Method*. Space Weather, 18(9), e2020SW002445. [![DOI](https://img.shields.io/badge/DOI-10.1029/2020SW002445-blue)](https://agupubs.onlinelibrary.wiley.com/doi/full/10.1029/2020SW002445)
